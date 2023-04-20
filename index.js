@@ -18,7 +18,7 @@ var isArray = Array.isArray;
 var defined = require('defined');
 var has = require('has');
 var sanitize = require('htmlescape').sanitize;
-var shasum = require('shasum');
+var shasum = require('shasum-object');
 
 var bresolve = require('browser-resolve');
 var resolve = require('resolve');
@@ -31,7 +31,6 @@ inherits(Browserify, EventEmitter);
 var fs = require('fs');
 var path = require('path');
 var cachedPathRelative = require('cached-path-relative');
-const { PassThrough } = require('stream');
 
 var paths = {
     empty: path.join(__dirname, 'lib/_empty.js')
@@ -63,6 +62,7 @@ function Browserify (files, opts) {
             })
         }
     }
+    
     self._options = opts;
     if (opts.noparse) opts.noParse = opts.noparse;
     
@@ -471,9 +471,6 @@ Browserify.prototype._createDeps = function (opts) {
     mopts.extensions = [ '.js', '.json' ].concat(mopts.extensions || []);
     self._extensions = mopts.extensions;
 
-    // Add depHashmap to the options
-    mopts.depHashmap = opts.depHashmap || {};
-
     mopts.transform = [];
     mopts.transformKey = defined(opts.transformKey, [ 'browserify', 'transform' ]);
     mopts.postFilter = function (id, file, pkg) {
@@ -515,39 +512,23 @@ Browserify.prototype._createDeps = function (opts) {
                     }
                 }
             }
-
-            if (mopts.depHashmap[id]) {
-                return cb(null, id, {__browserify_depHashmap_contents: mopts.depHashmap[id]});
-            }
+            
             if (file) {
                 var ex = '/' + relativePath(basedir, file);
-                if (self._external.indexOf(ex) >= 0 || self._exclude.indexOf(ex) >= 0) {
+                if (self._external.indexOf(ex) >= 0) {
+                    return cb(null, ex);
+                }
+                if (self._exclude.indexOf(ex) >= 0) {
                     return cb(null, ex);
                 }
                 if (self._ignore.indexOf(ex) >= 0) {
-                    if (mopts.depHashmap[ex]) {
-                        return cb(null, ex, {__browserify_depHashmap_contents: mopts.depHashmap[ex]});
-                    }
                     return cb(null, paths.empty, {});
                 }
             }
             if (err) cb(err, file, pkg)
             else if (file) {
                 if (opts.preserveSymlinks && parent.id !== self._mdeps.top.id) {
-                    const resolvedPath = path.resolve(file);
-
-                    if(mopts.depHashmap[resolvedPath]){
-                        return cb(null, resolvedPath, {__browserify_depHashmap_contents: mopts.depHashmap[resolvedPath]});
-                    }
-                    return cb(err, resolvedPath, pkg, file)
-                }
-
-                if (mopts.depHashmap[id]) {
-                    return cb(null, id, {__browserify_depHashmap_contents: mopts.depHashmap[id]});
-                }
-                const resolvedPath = path.resolve(file);
-                if(mopts.depHashmap[resolvedPath]){
-                    return cb(null, resolvedPath, {__browserify_depHashmap_contents: mopts.depHashmap[resolvedPath]});
+                    return cb(err, path.resolve(file), pkg, file)
                 }
 
                 fs.realpath(file, function (err, res) {
@@ -681,12 +662,16 @@ Browserify.prototype._recorder = function (opts) {
 Browserify.prototype._json = function () {
     return through.obj(function (row, enc, next) {
         if (/\.json$/.test(row.file)) {
-            const source = row.__browserify_depHashmap_contents
-            ? row.__browserify_depHashmap_contents.toString()
-            : row.source;
-            const sanitizedString = sanitize(source);
-
-            row.source = 'module.exports=' + sanitizedString
+            var sanitizedString = sanitize(row.source);
+            try {
+                // check json validity
+                JSON.parse(sanitizedString);
+                row.source = 'module.exports=' + sanitizedString;
+            } catch (err) {
+                err.message = 'While parsing ' + (row.file || row.id) + ': ' + err.message
+                this.emit('error', err);
+                return;
+            }
         }
         this.push(row);
         next();
@@ -869,46 +854,6 @@ Browserify.prototype.bundle = function (cb) {
 
     this._bundled = true;
     return output;
-};
-
-Browserify.prototype.streamDependencies = function (cb) {
-    var self = this;
-
-    if (cb && typeof cb === 'object') {
-        throw new Error(
-            'streamDependencies() no longer accepts option arguments.\n'
-            + 'Move all option arguments to the browserify() constructor.'
-        );
-    }
-
-    // Create deps stream using _createDeps() method
-    var deps = this._createDeps(this._options);
-    var passThrough = new PassThrough({ objectMode: true });
-
-    // Handle 'data' and 'end' events from deps stream.
-    deps.on('data', function (row) {
-        if (cb) cb(null, row);
-        passThrough.write(row);
-    });
-
-    deps.on('end', function () {
-        passThrough.end();
-        self.emit('end');
-    });
-
-    // Process recorded entries and dependencies
-    function ready() {
-        self._recorded.forEach(function (x) {
-            deps.write(x);
-        });
-
-        deps.end();
-    }
-
-    if (this._pending === 0) ready();
-    else this.once('_ready', ready);
-
-    return passThrough;
 };
 
 function isStream (s) { return s && typeof s.pipe === 'function' }
